@@ -41,6 +41,23 @@ def _pin_first():
     from hermes_cli import kanban_db
     return kanban_db.pin_first_board_resolution()
 
+def _t_or(key: str, fallback: str, **fmt) -> str:
+    """``t(key)`` but never return the bare dotted key.
+
+    ``agent.i18n.t`` falls back to the key itself when a catalog entry is
+    missing. For a chat-facing string a bare ``gateway.*`` token is worse than
+    an English sentence, so a miss substitutes ``fallback`` (still formatted
+    with ``fmt``). This is the guard that keeps an incomplete/missing locale
+    catalog from leaking raw i18n keys into a delivered message.
+    """
+    value = t(key, **fmt)
+    if isinstance(value, str) and value == key:
+        try:
+            return fallback.format(**fmt)
+        except (KeyError, IndexError, ValueError):
+            return fallback
+    return value
+
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
@@ -587,20 +604,55 @@ class _KanbanNotification:
             # for child tasks; use it only for legacy rows.
             self.session_key = sub["chat_id"] or getattr(task, "session_id", None) or ""
         # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
-        _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
-        _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-        synth = t(
+        # ``t()`` returns the bare key when a catalog is missing/incomplete; a raw
+        # ``gateway.kanban.wake.*`` token must NEVER reach the chat, so substitute
+        # the English sentence inline. (This is what let bare keys surface in
+        # Telegram when the installed runtime had no ``locales/`` dir.)
+        _parts = [
+            _t_or(f"gateway.kanban.wake.{k}", self._WAKE_KIND_FALLBACK.get(k, "status changed"))
+            for k in _WAKE_KINDS if k in self.wake_kinds
+        ]
+        _status = _t_or("gateway.kanban.wake.status_joiner", ", ").join(_parts) \
+            or _t_or("gateway.kanban.wake.status_default", "status changed")
+        synth = _t_or(
             "gateway.kanban.wake.message",
+            "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\n"
+            "Check the result or decide the next step.",
             task_id=sub["task_id"], status=_status, title=self.title,
             assignee=task.assignee if task else "", board=self.board_slug,
         )
         # Label as an automatic notification and carry the handoff so the
         # creator inspects the board instead of re-decomposing.
         if self.wake_handoff:
-            synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
+            synth += "\n" + _t_or("gateway.kanban.wake.handoff", "Result: {summary}",
+                                  summary=self.wake_handoff)
         if self.wake_review_detail:
-            synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
-        self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+            synth += "\n" + _t_or(
+                "gateway.kanban.wake.review_detail",
+                "Review feedback: {reason}\nInspect the existing card and its current review run; "
+                "return work to the same implementation task. Do not treat this BLOCK as approval "
+                "and do not create a duplicate task.",
+                reason=self.wake_review_detail,
+            )
+        self.synth = synth + "\n\n" + _t_or(
+            "gateway.kanban.wake.guidance",
+            "This is an automatic task-status notification, not a request to decompose the task again. "
+            "Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs "
+            "that already exist.",
+        )
+
+    # English sentences used when a catalog key is missing: ``t()`` would otherwise
+    # hand the caller the bare dotted key, which chat surfaces display verbatim.
+    _WAKE_KIND_FALLBACK = {
+        "completed": "completed",
+        "gave_up": "gave up (retries exhausted)",
+        "crashed": "crashed (worker exited); dispatcher will retry",
+        "timed_out": "timed out; dispatcher will retry",
+        "blocked": "blocked; needs attention",
+        "review_requested": "handed off for review; the implementation is done",
+        "changes_requested": "review requested changes (BLOCK); implementation is not approved",
+        "block_loop_detected": "routed to triage after repeated blocks; orchestration attention needed",
+    }
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
