@@ -74,6 +74,13 @@ def _locales_dir() -> Path:
 
     The source path is returned even when missing so ``_load_bundled`` can log
     the path it looked at rather than raise.
+
+    Installed runtimes copy the package code into an install workspace that has
+    no top-level ``locales/`` (only ``agent/``, ``gateway/``, ... are copied), so
+    the package-relative path resolves to a missing dir and EVERY ``t()`` call
+    returns its bare dotted key — which then reaches a chat surface as a raw
+    token. Fall back to the source checkout beside ``HERMES_HOME``
+    (``<home>/hermes-agent/locales``) before giving up.
     """
     override = os.getenv("HERMES_BUNDLED_LOCALES", "").strip()
     if override and Path(override).is_dir():
@@ -83,7 +90,20 @@ def _locales_dir() -> Path:
             "HERMES_BUNDLED_LOCALES points to a non-directory path (%s); "
             "falling back to bundled/source locale resolution", override,
         )
-    return Path(__file__).resolve().parent.parent / "locales"
+    bundled = Path(__file__).resolve().parent.parent / "locales"
+    if bundled.is_dir():
+        return bundled
+    # Installed/relocated runtime: the source checkout lives beside HERMES_HOME
+    # and carries the real catalogs. Resolve it so keys become sentences instead
+    # of leaking as bare ``gateway.*`` tokens into chat.
+    try:
+        from hermes_constants import get_hermes_home
+        checkout = get_hermes_home() / "hermes-agent" / "locales"
+        if checkout.is_dir():
+            return checkout
+    except Exception as exc:
+        logger.debug("i18n: source-checkout fallback for locales dir failed: %s", exc)
+    return bundled
 
 
 def _current_home() -> str:
