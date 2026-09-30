@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
 import threading
+import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from plugins.web._common import document as _page, page_error as _page_error, search_fail, search_ok, web_hit as _row
 
@@ -336,6 +340,76 @@ def keenable_extract_keyless(urls: list[str]) -> list[dict[str, Any]]:
     return _per_url(urls, _fetch, "keenable")
 
 
+# --- Quarantine: time-based cooldown for hard-failed vendors (mk addition) ----
+# A vendor that failed HARD (HTTP error / timeout / captcha / success:false —
+# NOT a mere empty result) is benched for QUARANTINE_SECONDS so the next
+# queries skip it instead of re-hitting a dead endpoint. Purely local state in
+# ~/mk-data/cache/szukaj-kwarantanna.json; when every vendor sits in
+# quarantine the earliest-expiring one is used so a query never dead-ends.
+_QUARANTINE_FILE = Path(os.environ.get("MK_SZUKAJ_KWARANTANNA")
+                         or os.path.expanduser("~/mk-data/cache/szukaj-kwarantanna.json"))
+_QUARANTINE_SECONDS = 2 * 60 * 60  # 2h, per task t_f34f58b5
+_quarantine_lock = threading.Lock()
+
+
+def _is_hard_failure(result: Any) -> bool:
+    """A vendor-transport failure (the result carries success:false), as opposed
+    to an empty-but-successful answer. Empty results never quarantine; non-dict
+    results (the per-URL extract lists) are never hard failures either."""
+    if not isinstance(result, dict):
+        return False
+    return not result.get("success", True)
+
+
+def quarantine_until(vendor: str, seconds: int = _QUARANTINE_SECONDS) -> float:
+    """Bench *vendor* until now+seconds; returns the expiry epoch."""
+    until = time.time() + seconds
+    try:
+        _QUARANTINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _quarantine_lock:
+            state = _load_quarantine()
+            state[vendor] = until
+            _QUARANTINE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("quarantine write failed for %s: %s", vendor, exc)
+    return until
+
+
+def _load_quarantine() -> Dict[str, float]:
+    try:
+        state = json.loads(_QUARANTINE_FILE.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            now = time.time()
+            live = {str(k): float(v) for k, v in state.items() if float(v) > now}
+            if len(live) != len(state):  # expired entries dropped on read
+                _QUARANTINE_FILE.write_text(json.dumps(live), encoding="utf-8")
+            return live
+    except (OSError, ValueError, TypeError) as exc:
+        logger.debug("quarantine read failed: %s", exc)
+    return {}
+
+
+def _quarantined_vendors() -> Dict[str, float]:
+    """Currently-benched vendors with their expiry epochs (fresh read)."""
+    with _quarantine_lock:
+        return _load_quarantine()
+
+
+def _filter_ring_by_quarantine(order: List[str]) -> List[str]:
+    """Ring order minus vendors still in quarantine. When that would empty the
+    list, keep only the vendor whose bench expires earliest (a search must
+    always have somewhere to go)."""
+    benched = _quarantined_vendors()
+    if not benched:
+        return order
+    live = [v for v in order if v not in benched]
+    if live:
+        return live
+    earliest = min(benched, key=benched.get)
+    logger.info("all keyless vendors quarantined; using earliest-expiring %s", earliest)
+    return [earliest]
+
+
 # --- Round-robin ring + next-in-line failover (rate-limited free tiers) -------
 _KEYLESS_RING = ("exa", "parallel", "firecrawl", "keenable")
 
@@ -365,7 +439,8 @@ def _vendor_pinned(name: str) -> bool:
 def _ring_order(name: str) -> list[str]:
     """Vendor walk order: pinned → start at *name* (its ring position fixes the failover
     succession); else round-robin from the cursor, advancing it per request. Vendors
-    pinned ``paid`` are excluded (explicit paid opts their free endpoint out)."""
+    pinned ``paid`` are excluded (explicit paid opts their free endpoint out), and so
+    are vendors still in quarantine (hard-failure cooldown, see above)."""
     global _ring_cursor
     if _vendor_pinned(name):
         start = _KEYLESS_RING.index(name) if name in _KEYLESS_RING else 0
@@ -374,7 +449,7 @@ def _ring_order(name: str) -> list[str]:
             start = _ring_cursor
             _ring_cursor = (_ring_cursor + 1) % len(_KEYLESS_RING)
     ordered = _KEYLESS_RING[start:] + _KEYLESS_RING[:start]
-    return [v for v in ordered if provider_tier(v) != "paid"]
+    return _filter_ring_by_quarantine([v for v in ordered if provider_tier(v) != "paid"])
 
 
 _ALL_PAID_MSG = "All keyless web providers are pinned to paid tiers."
@@ -383,31 +458,45 @@ _ALL_PAID_MSG = "All keyless web providers are pinned to paid tiers."
 def _walk_ring(name: str, kind: str, call, throttled) -> tuple:
     """Call each vendor from :func:`_ring_order` until a result is not ``throttled``.
     Returns ``(order, vendor, result, exhausted)``; ``order`` is empty (result None)
-    when every vendor is pinned paid."""
+    when every vendor is pinned paid. A hard failure (HTTP error, timeout, captcha,
+    success:false — anything with ``success`` not True) also advances to the next
+    vendor within the SAME query instead of ending the walk: like OpenClaw, when a
+    provider is down you try the next one. Hard failures additionally bench the
+    vendor in quarantine for 2h so subsequent queries skip it; an empty but
+    successful result is a real answer and never quarantines."""
     order = _ring_order(name)
     vendor, result = None, None
     for i, vendor in enumerate(order):
         result = call(vendor)
-        if not throttled(result):
+        if not throttled(result) and not _is_hard_failure(result):
             return order, vendor, result, False
+        if _is_hard_failure(result):
+            quarantine_until(vendor)
+            if i + 1 < len(order):
+                logger.info("keyless %s %s hard-failed (%s); failing over to %s",
+                            vendor, kind, (result.get("error") or "")[:120], order[i + 1])
+                continue
         if i + 1 < len(order):
             logger.info("keyless %s %s unavailable; failing over to %s", vendor, kind, order[i + 1])
     return order, vendor, result, True
 
 
 def search_with_failover(name: str, query: str, limit: int = 5) -> dict[str, Any]:
-    """Rate limits and vendor refusals (HTTP 401/402/403/5xx) advance to the next
-    vendor, other errors stop the walk (a malformed query fails everywhere).
-    ``data.served_by`` is set when the serving vendor differs from *name*."""
+    """Chain entry point. The managed chain (Synthetic → MiniMax → z.ai MCP, see the
+    ``_chain_search`` helpers below) serves first whenever it is configured; the keyless
+    ring below is the last-resort tier. ``data.served_by`` records who actually answered."""
 
     def _throttled(result: dict[str, Any]) -> bool:
         return not result.get("success") and _is_search_failover_eligible(result.get("error", ""))
 
+    chained = _chain_search(query, limit)
+    if chained is not None:
+        return chained
     order, vendor, result, exhausted = _walk_ring(name, "search", lambda v: _KEYLESS_SEARCHERS[v](query, limit), _throttled)
     if not order:
         return search_fail(_ALL_PAID_MSG)
     if exhausted:
-        result["error"] = f"{result.get('error', '')} (all keyless vendors unavailable: {', '.join(order)})"
+        result["error"] = f"{result.get('error', '')} (all keyless vendors failed or throttled: {', '.join(order)})"
     elif result.get("success") and vendor != name:
         result.setdefault("data", {})["served_by"] = vendor
     return result
@@ -425,3 +514,351 @@ def extract_with_failover(name: str, urls: list[str]) -> list[dict[str, Any]]:
     if not order:
         return [_page_error(u, _ALL_PAID_MSG) for u in urls]
     return results
+
+
+# --- Managed search chain: Synthetic → MiniMax → z.ai MCP (mk task t_f34f58b5) ----
+# Serves keyed/managed searches BEFORE the keyless ring, per Michał's fixed order:
+#   1. Synthetic  POST https://api.synthetic.new/v2/search   (Bearer SYNTHETIC_API_KEY;
+#      search has its OWN counter — 250 req/h, GET /v2/quotas is free) — run it until
+#      the hourly window is full; skip this query when requests == limit.
+#   2. MiniMax    POST https://api.minimax.io/v1/coding_plan/search  (body {"q": ...} —
+#      NOT "query"; no "model" field — the endpoint rejects/ignores it). Subscription
+#      key: env MINIMAX_CODE_PLAN_KEY, else one line of
+#      ~/.hermes/profiles/mk/secrets/minimax-code-plan.key. 5h window from
+#      GET /v1/coding_plan/remains (model "general"); go to 95% used, skip above.
+#      GET remains does not consume the search quota.
+#   3. z.ai Web Search MCP (config mcp_servers.zai_search, streamable HTTP JSON-RPC;
+#      Authorization from config — Bearer ${GLM_API_KEY}). Usage from the z.ai quota
+#      endpoint (stan.json written by ~/mk-stack/scripts/usage.py — same numbers the
+#      operator sees; reading it is a plain local file read). Hard stop at 80% of the
+#      MCP pool; never assume a numeric limit.
+#   4. Keyless ring (exa/parallel/keenable; firecrawl tier-pinned paid) — the caller's
+#      existing fallback, unchanged.
+# SearXNG and DuckDuckGo stay disabled. Only a HARD member failure advances the chain;
+# an empty result is an answer. The chain never raises — it returns None so the ring
+# takes over, or a search_fail(...) shaped result.
+
+MINIMAX_SEARCH_URL = "https://api.minimax.io/v1/coding_plan/search"
+MINIMAX_REMAINS_URL = "https://api.minimax.io/v1/coding_plan/remains"
+SYNTHETIC_SEARCH_URL = "https://api.synthetic.new/v2/search"
+SYNTHETIC_QUOTAS_URL = "https://api.synthetic.new/v2/quotas"
+_MINIMAX_KEY_FILE = Path("/home/hermes/.hermes/profiles/mk/secrets/minimax-code-plan.key")
+_ZAI_MCP_TIMEOUT = 60          # per-request seconds; web_search_prime can be slow
+_ZAI_MCP_PROTOCOL_VERSION = "2025-03-26"
+_MINIMAX_WINDOW_SECONDS = 5 * 60 * 60
+_ZAI_MCP_STOP_PCT = 80.0       # hard stop: skip z.ai when MCP usage >= 80%
+_MINIMAX_STOP_PCT = 95.0       # skip MiniMax when the 5h window is >= 95% used
+_ZAI_SESSION_LOCK = threading.Lock()
+_ZAI_SESSION: Dict[str, Optional[str]] = {"id": None}
+
+_chain_logger = logging.getLogger(__name__ + ".chain")
+
+
+def _chain_http_json(url: str, *, key: str = "", body: Optional[Dict[str, Any]] = None,
+                     headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> Tuple[int, str]:
+    """POST/GET JSON; returns (status, body-text). Raises KeylessMCPError on transport failure."""
+    import requests
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "hermes-agent"}
+    if key:
+        req_headers["Authorization"] = "Bearer " + key
+    if headers:
+        req_headers.update(headers)
+    try:
+        if body is None:
+            response = requests.get(url, headers=req_headers, timeout=timeout)
+        else:
+            response = requests.post(url, json=body, headers=req_headers, timeout=timeout)
+    except requests.RequestException as exc:
+        raise KeylessMCPError(f"request failed: {exc}") from exc
+    return response.status_code, response.content.decode("utf-8", errors="replace")
+
+
+def _provider_env(name: str) -> str:
+    """Config-aware env lookup (process env, then the profile .env). Empty when unset."""
+    try:
+        from agent.web_search_provider import get_provider_env
+        return get_provider_env(name)
+    except Exception:  # noqa: BLE001 — stripped envs: plain os.environ
+        return os.environ.get(name, "")
+
+
+# --- 1. Synthetic -----------------------------------------------------------------
+def _synthetic_ready() -> Tuple[bool, str]:
+    """(callable_now, reason). Reads GET /v2/quotas (free); search.hourly governs."""
+    key = _provider_env("SYNTHETIC_API_KEY")
+    if not key:
+        return False, "no SYNTHETIC_API_KEY"
+    try:
+        status, text = _chain_http_json(SYNTHETIC_QUOTAS_URL, key=key)
+    except KeylessMCPError as exc:
+        return False, f"quotas: {exc}"
+    if status >= 400:
+        return False, f"quotas HTTP {status}"
+    try:
+        hourly = ((json.loads(text) or {}).get("search") or {}).get("hourly") or {}
+        requests_made, limit = int(hourly.get("requests", 0)), int(hourly.get("limit", 0))
+    except (ValueError, TypeError):
+        return False, "quotas: unexpected shape"
+    if limit and requests_made >= limit:
+        return False, f"search.hourly full ({requests_made}/{limit})"
+    return True, f"search.hourly {requests_made}/{limit}"
+
+
+def _synthetic_search(query: str, limit: int) -> Dict[str, Any]:
+    key = _provider_env("SYNTHETIC_API_KEY")
+    if not key:
+        return search_fail("synthetic: no SYNTHETIC_API_KEY")
+    status, text = _chain_http_json(SYNTHETIC_SEARCH_URL, key=key, body={"query": query, "num_results": max(1, int(limit))})
+    if status >= 400:
+        return search_fail(f"synthetic: HTTP {status}: {text[:200]}")
+    try:
+        rows = json.loads(text).get("results") or []
+    except ValueError:
+        return search_fail(f"synthetic: unexpected payload: {text[:200]}")
+    return search_ok([
+        _row(r.get("url") or "", r.get("title") or "", (r.get("text") or "")[:500], i + 1)
+        for i, r in enumerate(rows[: max(1, int(limit))] if limit else rows)
+    ])
+
+
+# --- 2. MiniMax -------------------------------------------------------------------
+def _minimax_key() -> str:
+    """Subscription key: env MINIMAX_CODE_PLAN_KEY, else one line of the secrets file."""
+    key = _provider_env("MINIMAX_CODE_PLAN_KEY")
+    if key:
+        return key
+    try:
+        for line in _MINIMAX_KEY_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                return line
+    except OSError:
+        pass
+    return ""
+
+
+def _minimax_ready(key: str) -> Tuple[bool, str]:
+    """(callable_now, reason) from GET /v1/coding_plan/remains, model 'general' (5h window).
+    Prefers the API's own remaining percent; falls back to usage/total inside the window."""
+    if not key:
+        return False, "no MINIMAX_CODE_PLAN_KEY and no secrets file"
+    try:
+        status, text = _chain_http_json(MINIMAX_REMAINS_URL, key=key)
+    except KeylessMCPError as exc:
+        return False, f"remains: {exc}"
+    if status >= 400:
+        return False, f"remains HTTP {status}"
+    try:
+        data = json.loads(text)
+        general = next(m for m in (data.get("model_remains") or []) if m.get("model_name") == "general")
+    except (ValueError, StopIteration, TypeError):
+        return False, "remains: no 'general' bucket"
+    remaining_pct = general.get("current_interval_remaining_percent")
+    if isinstance(remaining_pct, (int, float)):
+        if remaining_pct <= 100.0 - _MINIMAX_STOP_PCT:
+            return False, f"5h window {100.0 - remaining_pct:.0f}% used (>= {_MINIMAX_STOP_PCT:.0f}%)"
+        return True, f"5h window {100.0 - remaining_pct:.0f}% used"
+    now = time.time()
+    start, total, used = general.get("start_time"), general.get("current_interval_total_count"), general.get("current_interval_usage_count")
+    if not (isinstance(start, (int, float)) and now * 1000 - start <= _MINIMAX_WINDOW_SECONDS * 1000):
+        return True, "5h window boundary: treating as fresh"
+    if isinstance(total, (int, float)) and total > 0 and used / total >= _MINIMAX_STOP_PCT / 100.0:
+        return False, f"5h window {used}/{total} used (>= {_MINIMAX_STOP_PCT:.0f}%)"
+    return True, "5h window below stop threshold"
+
+
+def _minimax_search(query: str, limit: int) -> Dict[str, Any]:
+    key = _minimax_key()
+    if not key:
+        return search_fail("minimax: no subscription key (MINIMAX_CODE_PLAN_KEY / secrets file)")
+    status, text = _chain_http_json(MINIMAX_SEARCH_URL, key=key, body={"q": query})
+    if status >= 400:
+        return search_fail(f"minimax: HTTP {status}: {text[:200]}")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return search_fail(f"minimax: unexpected payload: {text[:200]}")
+    base = data.get("base_resp") or {}
+    if base.get("status_code") not in (0, None):
+        return search_fail(f"minimax: success false ({base.get('status_msg') or base.get('status_code')})")
+    return search_ok([
+        _row(r.get("link") or "", r.get("title") or "", r.get("snippet") or "", i + 1)
+        for i, r in enumerate((data.get("organic") or [])[: max(1, int(limit))] if limit else (data.get("organic") or []))
+    ])
+
+
+# --- 3. z.ai Web Search MCP (streamable HTTP JSON-RPC) -----------------------------
+def _zai_mcp_config() -> Tuple[str, str]:
+    """(url, Authorization header) from config ``mcp_servers.zai_search`` — the same
+    expansion the gateway uses (``${VAR}`` refs resolved via the config env layer)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("mcp_servers") or {}).get("zai_search") or {}
+        url = str(cfg.get("url") or "")
+        auth = str((cfg.get("headers") or {}).get("Authorization") or "")
+
+        def _expand(value: str) -> str:
+            return re.sub(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                lambda m: _provider_env(m.group(1)),
+                value,
+            )
+
+        return _expand(url), _expand(auth)
+    except Exception as exc:  # noqa: BLE001 — config layer optional
+        _chain_logger.debug("zai mcp config read failed: %s", exc)
+        return "", ""
+
+
+def _zai_ready(url: str, auth: str) -> Tuple[bool, str]:
+    """(callable_now, reason): usable credentials AND MCP pool below the hard stop.
+    Usage comes from the z.ai quota endpoint via the stan.json the usage monitor
+    maintains — the same numbers the operator sees; never a guessed limit."""
+    if not url or not auth:
+        return False, "no zai_search mcp config/credentials"
+    try:
+        from hermes_cli.config import get_env_value
+        mcp_pct = (get_env_value("ZAI_MCP_PCT") or "").strip()
+    except Exception:  # noqa: BLE001 — fall through to os.environ
+        mcp_pct = ""
+    if not mcp_pct:
+        mcp_pct = os.environ.get("ZAI_MCP_PCT", "")
+    if not mcp_pct:
+        try:
+            stan = json.loads(Path("~/mk-data/usage/stan.json").expanduser().read_text(encoding="utf-8"))
+            mcp_pct = str(stan.get("mcp_pct", "") or "")
+        except (OSError, ValueError):
+            mcp_pct = ""
+    try:
+        if mcp_pct and float(mcp_pct) >= _ZAI_MCP_STOP_PCT:
+            return False, f"z.ai MCP pool at {mcp_pct}% (>= {_ZAI_MCP_STOP_PCT:.0f}%)"
+    except ValueError:
+        pass
+    return True, "below MCP stop threshold"
+
+
+def _zai_session_id(url: str, auth: str) -> Optional[str]:
+    """Initialize once per process and keep the server-issued session id."""
+    with _ZAI_SESSION_LOCK:
+        if _ZAI_SESSION["id"]:
+            return _ZAI_SESSION["id"]
+        status, text = _chain_http_json(
+            url, body={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": _ZAI_MCP_PROTOCOL_VERSION, "capabilities": {},
+                           "clientInfo": {"name": "hermes-agent", "version": "1.0"}},
+            }, headers={"Authorization": auth, "Accept": "application/json, text/event-stream"},
+            timeout=_ZAI_MCP_TIMEOUT)
+        if status >= 400:
+            raise KeylessMCPError(f"HTTP {status}: {text[:200]}")
+        if '"error"' in text or '"code":40' in text:
+            raise KeylessMCPError(f"initialize rejected: {text[:200]}")
+        # The server may be stateless (no mcp-session-id issued — z.ai is): keep None
+        # and never send a made-up session header.
+        session = None
+        header_names = ("mcp-session-id", "Mcp-Session-Id")
+        try:
+            import requests as _requests
+            probe = _requests.post(
+                url, json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                         "Authorization": auth}, timeout=_ZAI_MCP_TIMEOUT)
+            session = next((probe.headers[n] for n in header_names if probe.headers.get(n)), None)
+        except _requests.RequestException:
+            pass
+        _ZAI_SESSION["id"] = session
+        return session
+
+
+def _zai_search(query: str, limit: int) -> Dict[str, Any]:
+    url, auth = _zai_mcp_config()
+    if not url or not auth:
+        return search_fail("z.ai: no zai_search mcp config/credentials")
+    try:
+        session = _zai_session_id(url, auth)
+    except KeylessMCPError as exc:
+        return search_fail(f"z.ai: initialize failed: {exc}")
+    headers = {"Authorization": auth}
+    if session:
+        headers["mcp-session-id"] = session
+    status, text = _chain_http_json(
+        url, body={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "web_search_prime",
+                       "arguments": {"search_query": query[:70], "location": "us"}},
+        }, headers=headers, timeout=_ZAI_MCP_TIMEOUT)
+    if status >= 400:
+        return search_fail(f"z.ai: HTTP {status}: {text[:200]}")
+    payload = ""
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            try:
+                data = json.loads(line[len("data: "):])
+            except ValueError:
+                continue
+            if data.get("error"):
+                return search_fail(f"z.ai: rpc error: {json.dumps(data['error'])[:200]}")
+            for item in ((data.get("result") or {}).get("content") or []):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    payload += item.get("text") or ""
+    if not payload:
+        try:
+            data = json.loads(text)
+            if data.get("error"):
+                return search_fail(f"z.ai: rpc error: {json.dumps(data['error'])[:200]}")
+            for item in ((data.get("result") or {}).get("content") or []):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    payload += item.get("text") or ""
+        except ValueError:
+            return search_fail(f"z.ai: unrecognized response: {text[:200]}")
+    try:
+        rows = json.loads(payload)
+    except ValueError:
+        return search_fail(f"z.ai: unexpected tool payload: {payload[:200]}")
+    if isinstance(rows, dict):
+        rows = rows.get("results") or rows.get("data") or []
+    return search_ok([
+        _row(r.get("link") or r.get("url") or "", r.get("title") or "", r.get("content") or r.get("snippet") or "", i + 1)
+        for i, r in enumerate(rows[: max(1, int(limit))] if limit else rows)
+        if isinstance(r, dict)
+    ])
+
+
+# --- chain driver -------------------------------------------------------------------
+# Late-bound member table (same convention as _KEYLESS_SEARCHERS): the driver looks the
+# callable up at call time, so tests can rebind module attrs or setitem this dict.
+_CHAIN_MEMBERS = ("synthetic", "minimax", "z.ai")
+_CHAIN_SEARCHERS: Dict[str, Callable[[str, int], Dict[str, Any]]] = {
+    "synthetic": _synthetic_search, "minimax": _minimax_search, "z.ai": _zai_search,
+}
+
+
+def _chain_search(query: str, limit: int) -> Optional[Dict[str, Any]]:
+    """Synthetic → MiniMax → z.ai; None when the chain is unconfigured/exhausted so the
+    keyless ring takes over. Only hard failures advance; empty results are answers."""
+    zai_url, zai_auth = _zai_mcp_config()
+    readiness = {
+        "synthetic": _synthetic_ready,
+        "minimax": lambda: _minimax_ready(_minimax_key()),
+        "z.ai": lambda: _zai_ready(zai_url, zai_auth),
+    }
+    for name in _CHAIN_MEMBERS:
+        check = readiness[name]
+        try:
+            ok, reason = check()
+        except Exception as exc:  # noqa: BLE001 — a broken readiness probe must not kill the chain
+            _chain_logger.debug("chain %s readiness probe raised: %s", name, exc)
+            ok, reason = True, "probe error — attempting anyway"
+        if not ok:
+            _chain_logger.info("chain %s skipped: %s", name, reason)
+            continue
+        try:
+            result = _CHAIN_SEARCHERS[name](query, limit)
+        except Exception as exc:  # noqa: BLE001 — treat as a hard member failure
+            _chain_logger.info("chain %s raised (%s); advancing", name, exc)
+            result = search_fail(f"{name}: {exc}")
+        if isinstance(result, dict) and result.get("success"):
+            result.setdefault("data", {})["served_by"] = name
+            return result
+        _chain_logger.info("chain %s failed (%s); advancing", name, (result or {}).get("error", ""))
+    return None
