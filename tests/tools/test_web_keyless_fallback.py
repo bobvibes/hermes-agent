@@ -22,6 +22,13 @@ from plugins.web.parallel.provider import ParallelWebSearchProvider
 
 
 @pytest.fixture(autouse=True)
+def _quarantine_sandbox(monkeypatch, tmp_path):
+    """Every test in this module gets an isolated quarantine file so benching
+    never leaks into the real ~/mk-data/cache/szukaj-kwarantanna.json."""
+    monkeypatch.setattr(keyless_mcp, "_QUARANTINE_FILE", tmp_path / "quarantine.json")
+
+
+@pytest.fixture(autouse=True)
 def _no_web_env(monkeypatch):
     """Blank every web credential and neutralize config lookups."""
     for var in (
@@ -591,20 +598,25 @@ class TestKeylessFailover:
         assert out["success"] is True
         assert out["data"]["served_by"] == "keenable"
 
-    def test_search_no_failover_on_non_throttle_error(self, monkeypatch):
+    def test_search_fails_over_on_non_throttle_error(self, monkeypatch):
+        """A hard failure (403/timeout/success:false — not rate-limit-shaped) must
+        also advance to the next vendor in the SAME query (task t_f34f58b5) and
+        bench the failed vendor in quarantine."""
         self._pin(monkeypatch, "exa")
         monkeypatch.setitem(
             keyless_mcp._KEYLESS_SEARCHERS, "exa",
             lambda q, l: {"success": False, "error": "Unrecognized MCP response shape"},
         )
-        called = []
         monkeypatch.setitem(
             keyless_mcp._KEYLESS_SEARCHERS, "parallel",
-            lambda q, l: called.append(1) or self._ok("parallel"),
+            lambda q, l: self._ok("parallel"),
         )
         out = keyless_mcp.search_with_failover("exa", "q")
-        assert out["success"] is False
-        assert not called  # peer never tried
+        assert out["success"] is True
+        assert out["data"]["served_by"] == "parallel"
+        # exa benched for ~2h
+        benched = keyless_mcp._load_quarantine()
+        assert "exa" in benched and benched["exa"] > keyless_mcp.time.time()
 
     def test_search_all_throttled_reports_ring(self, monkeypatch):
         self._pin(monkeypatch, "exa")
@@ -615,7 +627,46 @@ class TestKeylessFailover:
             )
         out = keyless_mcp.search_with_failover("exa", "q")
         assert out["success"] is False
-        assert "all keyless vendors unavailable" in out["error"]
+        assert "all keyless vendors failed or throttled" in out["error"]
+
+    def test_empty_success_never_quarantines(self, monkeypatch):
+        """An empty but successful result is a real answer: no quarantine entry."""
+        self._pin(monkeypatch, "exa")
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "exa",
+            lambda q, l: {"success": True, "data": {"web": []}},
+        )
+        out = keyless_mcp.search_with_failover("exa", "q")
+        assert out["success"] is True
+        assert keyless_mcp._load_quarantine() == {}
+
+    def test_quarantined_vendor_skipped_in_ring(self, monkeypatch):
+        """A benched vendor drops out of the walk until its bench expires."""
+        self._pin(monkeypatch, "exa")
+        keyless_mcp.quarantine_until("exa", seconds=3600)
+        called = []
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "exa",
+            lambda q, l: called.append(1) or self._ok("exa"),
+        )
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "parallel",
+            lambda q, l: self._ok("parallel"),
+        )
+        out = keyless_mcp.search_with_failover("exa", "q")
+        assert out["success"] is True
+        assert out["data"]["served_by"] == "parallel"
+        assert not called  # benched exa never tried
+
+    def test_all_quarantined_uses_earliest_expiry(self, monkeypatch, tmp_path):
+        """When every vendor is benched, the earliest-expiring one is used."""
+        self._pin(monkeypatch, "exa")
+        now = keyless_mcp.time.time()
+        keyless_mcp._QUARANTINE_FILE.write_text(
+            json.dumps({v: now + 600 + 60 * i for i, v in enumerate(keyless_mcp._KEYLESS_RING)}),
+            encoding="utf-8",
+        )
+        assert keyless_mcp._ring_order("exa") == ["exa"]  # earliest bench wins
 
     def test_search_walks_ring_past_multiple_throttles(self, monkeypatch):
         # exa -> parallel all throttled; firecrawl serves.
