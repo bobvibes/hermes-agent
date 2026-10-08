@@ -42,13 +42,11 @@ def initial_task_state(
             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
         if tenant is None:
             tenant = next((rows[pid]["tenant"] for pid in parents if rows[pid]["tenant"]), None)
+    # Entry is triage. Explicit initial_status=blocked is the only other
+    # entry (human park). Open parents do not skip triage.
     if initial_status == "blocked":
         return "blocked", tenant
-    if triage:
-        return "triage", tenant
-    if any(row["status"] != "done" for row in rows.values()):
-        return "todo", tenant
-    return "ready", tenant
+    return "triage", tenant
 
 
 def _validate_children_graph(children: list) -> None:

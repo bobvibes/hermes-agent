@@ -152,6 +152,26 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    kind_gated: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, expected)`` ready cards the title-routing gate
+    refused this tick. Surfaced by :func:`describe_suppression` so a
+    "0 workers spawned" warning names the reason instead of leaving the
+    operator guessing (#3ce0c112)."""
+    kind_rerouted: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, from_assignee, to_assignee)`` triaged ready cards whose
+    title belongs to the other GLM worker lane (mk-duzy <-> mk-szybki). The
+    assignee is rewritten instead of stranding the card in ``ready`` forever
+    (dispatcher-fix-20261006)."""
+    model_capped: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, model)`` held back by
+    ``kanban.max_in_progress_per_model``. Capacity, not a fault: the card
+    stays ``ready`` and is picked up when a worker of that model finishes."""
+    type_capped: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, bucket)`` held back by the title type cap
+    (weryfikacja / szablon)."""
+    capacity_full: Optional[str] = None
+    """``"max_in_progress"`` / ``"max_spawn"`` when the host/board running
+    count already filled the budget, so the tick spawned nothing by design."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -175,12 +195,57 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.kind_gated:
+            counts["kind_gated"] = counts.get("kind_gated", 0) + len(res.kind_gated)
+        # Capacity holds (dispatcher-fix-20261006): previously silent, so a
+        # warning fired with no reason while every ready card simply waited
+        # for a free per-model / per-profile / host slot.
+        kind_rerouted = getattr(res, "kind_rerouted", None) or []
+        if kind_rerouted:
+            counts["kind_rerouted"] = counts.get("kind_rerouted", 0) + len(kind_rerouted)
+        for _task_id, _assignee, model in (getattr(res, "model_capped", None) or []):
+            key = f"model_cap[{model}]"
+            counts[key] = counts.get(key, 0) + 1
+        for _task_id, bucket in (getattr(res, "type_capped", None) or []):
+            key = f"type_cap[{bucket}]"
+            counts[key] = counts.get(key, 0) + 1
+        if res.skipped_per_profile_capped:
+            counts["per_profile_cap"] = (
+                counts.get("per_profile_cap", 0) + len(res.skipped_per_profile_capped)
+            )
+        if getattr(res, "capacity_full", None):
+            key = f"capacity_full[{res.capacity_full}]"
+            counts[key] = counts.get(key, 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def capacity_only_hold(results: Iterable[Optional["DispatchResult"]]) -> bool:
+    """True when the tick spawned nothing ONLY because configured capacity is
+    full (per-model / per-profile / type cap, host ``max_in_progress``).
+
+    The embedded dispatcher's "stuck" health counter uses this to stop
+    reporting a healthy, saturated dispatcher as stuck. Any non-capacity hold
+    (kind gate, respawn guard, unassigned / nonspawnable card, lock contention,
+    memory pressure, a spawn) makes it False so real stalls still warn
+    (dispatcher-fix-20261006).
+    """
+    saw_capacity = False
+    for res in results:
+        if res is None:
+            continue
+        if (res.spawned or res.kind_gated or res.respawn_guarded
+                or res.skipped_unassigned or res.skipped_nonspawnable
+                or res.skipped_locked or res.memory_pressure):
+            return False
+        if (getattr(res, "model_capped", None) or getattr(res, "type_capped", None)
+                or res.skipped_per_profile_capped or getattr(res, "capacity_full", None)):
+            saw_capacity = True
+    return saw_capacity
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1559,7 +1624,7 @@ def check_respawn_guard(
     #    reaches the breaker.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, ended_at, metadata, error FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -1588,7 +1653,17 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    latest_err = _kb._lossy_text(latest_run["error"]) if latest_run is not None else ""
+    # The latest run wins. A quota stamp left on last_failure_error must
+    # not park a later blocked run (that is blocker_auth on groomer/sport).
+    # rate_limited already returned above. No run at all still uses the stamp.
+    if latest_run is None:
+        evidence = err
+    elif latest_outcome == "blocked":
+        evidence = latest_err
+    else:
+        evidence = latest_err or err
+    if evidence and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(evidence):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1738,6 +1813,12 @@ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
             allowed.add(normalize_profile_name(n))
         except ValueError:
             continue
+    # Triage worker. profiles/mk/config.yaml is root-owned (hermes cannot
+    # write dispatch_profiles). Keep mk-minimax claimable anyway.
+    try:
+        allowed.add(normalize_profile_name("mk-minimax"))
+    except ValueError:
+        pass
     return frozenset(allowed)
 
 
@@ -2022,6 +2103,260 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+# Type caps, in addition to max_in_progress and max_in_progress_per_profile.
+# Verification: title contains "weryfikacj" (weryfikacja, weryfikacji,
+# weryfikatora, v2, "wróć do weryfikatora"). Templates: one shared bucket
+# for "popraw szablon" or "stwórz szablon" (also "stworz szablon").
+# Autor, Mail todo, triage and everything else have no type cap.
+_TYPE_CAP_WERYFIKACJA = 3
+_TYPE_CAP_SZABLON = 2
+_TYPE_CAPS = {
+    "weryfikacja": _TYPE_CAP_WERYFIKACJA,
+    "szablon": _TYPE_CAP_SZABLON,
+}
+
+
+def _title_type_bucket(title: Optional[str]) -> Optional[str]:
+    """Return the type-cap bucket for a title, or None when uncapped."""
+    text = (title or "").casefold()
+    # "weryfikacj" covers weryfikacja/weryfikacji; "weryfikator" covers
+    # weryfikatora and "wróć do weryfikatora" (that stem has no "cj").
+    if "weryfikacj" in text or "weryfikator" in text:
+        return "weryfikacja"
+    if (
+        "popraw szablon" in text
+        or "stwórz szablon" in text
+        or "stworz szablon" in text
+    ):
+        return "szablon"
+    return None
+
+
+def _count_running_type_buckets(conn: sqlite3.Connection) -> dict[str, int]:
+    """Running tasks of each capped type. Later spawns in this tick add on."""
+    counts = {name: 0 for name in _TYPE_CAPS}
+    for row in conn.execute("SELECT title FROM tasks WHERE status = 'running'"):
+        bucket = _title_type_bucket(row["title"])
+        if bucket:
+            counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+
+_DEFAULT_PER_MODEL_CAPS = {
+    "glm-5.3": 3,
+    "glm-5.3-flash": 5,
+}
+
+
+def _per_model_caps() -> dict[str, int]:
+    """``kanban.max_in_progress_per_model`` from the gateway config.
+
+    A missing or unreadable key keeps the safe defaults (glm-5.3: 3,
+    glm-5.3-flash: 5). It is never treated as unlimited. Other models are
+    not capped here; the host ``max_in_progress`` still applies. Explicit
+    positive integers overlay the defaults.
+    """
+    caps = dict(_DEFAULT_PER_MODEL_CAPS)
+    raw = None
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban = (load_config_readonly() or {}).get("kanban") or {}
+        if isinstance(kanban, dict):
+            raw = kanban.get("max_in_progress_per_model")
+    except Exception:
+        raw = None
+    if isinstance(raw, dict):
+        for model, limit in raw.items():
+            name = str(model).strip()
+            if not name:
+                continue
+            try:
+                ival = int(limit)
+            except (TypeError, ValueError):
+                continue
+            if ival >= 1:
+                caps[name] = ival
+    for model, limit in _DEFAULT_PER_MODEL_CAPS.items():
+        caps.setdefault(model, limit)
+    return caps
+
+
+def _assignee_default_model(assignee: Optional[str]) -> Optional[str]:
+    """``model.default`` of the assignee profile. Assignees are not hardcoded."""
+    name = (assignee or "").strip()
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import _read_config_model, get_profile_dir
+        model, _provider = _read_config_model(get_profile_dir(name))
+    except Exception:
+        return None
+    if not isinstance(model, str):
+        return None
+    model = model.strip()
+    return model or None
+
+
+def _resolved_task_model(model_override: Optional[str], assignee: Optional[str]) -> Optional[str]:
+    """Card model: non-empty ``tasks.model_override``, else the assignee default."""
+    override = (model_override or "").strip()
+    if override:
+        return override
+    return _assignee_default_model(assignee)
+
+
+def _resolved_model_for_row(conn: sqlite3.Connection, row: sqlite3.Row, assignee: str) -> Optional[str]:
+    model_override = None
+    try:
+        model_override = row["model_override"]
+    except (IndexError, KeyError):
+        got = conn.execute(
+            "SELECT model_override FROM tasks WHERE id = ?", (row["id"],)
+        ).fetchone()
+        if got is not None:
+            model_override = got["model_override"]
+    return _resolved_task_model(model_override, assignee)
+
+
+def _count_running_by_resolved_model(conn: sqlite3.Connection) -> dict[str, int]:
+    """Running cards grouped by resolved model (override, else assignee default)."""
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE status = 'running'"
+    ):
+        model = _resolved_task_model(row["model_override"], row["assignee"])
+        if not model:
+            continue
+        counts[model] = counts.get(model, 0) + 1
+    return counts
+
+
+
+_KIND_GATE_LOGGED = set()
+
+
+def _expected_assignee_for_title(title):
+    """Kind gate. Returns (assignee, kind). Unknown titles stay on mk-minimax.
+    v2 stays mk-szybki even though the title contains weryfikacja.
+    Research, w tym kanałów B2C, po triage jest pracą mk-duzy, nie mk-szybki.
+    Weryfikacja i szablony zostają na mk-szybki. Tor triage (lane) jest osobno: mk-minimax.
+    """
+    t = title or ""
+    if "weryfikacja v2" in t:
+        return "mk-szybki", "weryfikacja-v2"
+    if t.startswith("Zweryfikuj szkice") or "weryfikacja paczki" in t:
+        return "mk-szybki", "weryfikacja-paczki"
+    if (t.startswith("wróć do autora:") or t.startswith("Rada:")
+            or t.startswith("Rada t_") or t.startswith("Przegląd Radą:")):
+        return "mk-duzy", "autor-rada"
+    if t.startswith("Maile ") and ": autor" in t and "weryfikacja" not in t:
+        return "mk-duzy", "autor"
+    if t.startswith("wróć do weryfikatora:"):
+        return "mk-szybki", "weryfikator"
+    if ("stwórz szablon dla segmentu" in t or t.startswith("Popraw szablon")
+            or "zgłoś szablony" in t or "opracuj wstrzymane maile" in t
+            or t.startswith("Szablon ") or t.startswith("Szablony:")):
+        return "mk-szybki", "szablon"
+    if t.startswith("Maile ") and ": weryfikacja" in t:
+        return "mk-szybki", "weryfikacja"
+    folded = t.casefold()
+    if "kanał b2c" in folded or "kanal b2c" in folded:
+        return "mk-duzy", "research-b2c"
+    if t.startswith("Research"):
+        return "mk-duzy", "research"
+    if (t.startswith("triage:") or t.startswith("Triage:") or "organizacja tablicy" in t
+            or t.startswith("Mail todo:")
+            or t.startswith("Cron:") or "uzupełnij" in t or t.startswith("werdykt:")):
+        return "mk-minimax", "triage"
+    # Unclassified title: no verdict on who should own this card. Returning
+    # None lets an already-triaged card run under its own assignee instead of
+    # stranding it in `ready` with 0 spawns forever (#3ce0c112). The triage
+    # lane still routes unknown titles to mk-minimax below, and an untriaged
+    # card is still pulled back through triage (see _dispatch_lane_task).
+    return None, "inne"
+
+
+def _card_passed_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True once a card has been worked or explicitly specified out of triage."""
+    if conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+    ).fetchone():
+        return True
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'specified' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None:
+        return True
+    # Manual reassign --skip-triage / glm-flash fallback marker also count.
+    if _kb._has_manual_override(conn, task_id):
+        return True
+    if _kb._has_fallback_from_marker(conn, task_id):
+        return True
+    return False
+
+
+def _send_untriaged_to_triage(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool,
+    reason: str = "assignee set before triage",
+) -> None:
+    """Ready/todo card that must go back through triage. Priority stays."""
+    if dry_run:
+        return
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'triage', assignee = 'mk-minimax' "
+            "WHERE id = ? AND status IN ('ready', 'todo') AND claim_lock IS NULL",
+            (task_id,),
+        )
+        if cur.rowcount == 1:
+            _kb._append_event(conn, task_id, "triaged", {
+                "reason": reason,
+                "assignee": "mk-minimax",
+            })
+
+
+def _release_triage_holds(conn: sqlite3.Connection) -> None:
+    """Drop the pre-restart hold so mk-minimax can claim triage cards."""
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL "
+            "WHERE status = 'triage' AND claim_lock = 'triage-hold-20261004'"
+        )
+
+
+_KIND_REROUTABLE = frozenset({"mk-duzy", "mk-szybki"})
+
+
+def _reroute_kind_mismatch(
+    conn: sqlite3.Connection, task_id: str, from_assignee: str, to_assignee: str,
+    title_kind: str, *, dry_run: bool,
+) -> None:
+    """Move a triaged ready card to the GLM lane its title belongs to.
+
+    Only mk-duzy <-> mk-szybki, only ``status='ready'`` with no claim, and only
+    while the assignee is still ``from_assignee`` (CAS). Status, priority and
+    model_override are untouched; never writes blocked (dispatcher-fix-20261006).
+    """
+    if dry_run:
+        return
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ? AND status = 'ready' "
+            "AND claim_lock IS NULL AND assignee = ?",
+            (to_assignee, task_id, from_assignee),
+        )
+        if cur.rowcount == 1:
+            _kb._append_event(conn, task_id, "kind_rerouted", {
+                "from": from_assignee, "to": to_assignee, "kind": title_kind,
+                "source": "dispatcher-fix-20261006",
+            })
+    _kb._log.warning(
+        "kanban kind-gate reroute task=%s kind=%s %s -> %s",
+        task_id, title_kind, from_assignee, to_assignee,
+    )
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2036,6 +2371,9 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    type_running: Optional[dict[str, int]] = None,
+    per_model_caps: Optional[Mapping[str, int]] = None,
+    per_model_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2070,6 +2408,115 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Per-model cap, before claim. Over-cap cards stay ready: no claim, no
+    # spawn, no blocked status. Only models listed in the cap map are gated;
+    # every other model stays under the host max_in_progress alone.
+    if per_model_caps is None:
+        per_model_caps = _per_model_caps()
+    if per_model_running is None:
+        per_model_running = _count_running_by_resolved_model(conn)
+    resolved_model = _resolved_model_for_row(conn, row, assignee)
+    if resolved_model:
+        model_cap = per_model_caps.get(resolved_model)
+        if model_cap is not None and per_model_running.get(resolved_model, 0) >= model_cap:
+            result.model_capped.append((task_id, assignee, resolved_model))
+            return False
+    # Kind gate, before claim. Wrong assignee stays ready: no claim, no blocked,
+    # no model_override write. One log line per (task, assignee, expected).
+    try:
+        _kind_title = row["title"]
+    except (IndexError, KeyError):
+        _got_title = conn.execute(
+            "SELECT title FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        _kind_title = _got_title["title"] if _got_title is not None else None
+    if lane == "triage":
+        _expected_assignee, _title_kind = "mk-minimax", "triage"
+    else:
+        _expected_assignee, _title_kind = _expected_assignee_for_title(_kind_title)
+    if lane == "ready" and assignee == "mk-minimax":
+        # mk-minimax outside triage only via glm-flash-429 fallback marker.
+        if not _kb._has_fallback_from_marker(conn, task_id):
+            _send_untriaged_to_triage(
+                conn, task_id, dry_run=dry_run,
+                reason="mk-minimax outside triage without fallback_from",
+            )
+            return False
+    if _expected_assignee is not None and assignee != _expected_assignee:
+        # Manual --skip-triage override: honour the chosen assignee.
+        if _kb._has_manual_override(conn, task_id):
+            pass
+        else:
+            # A card that has not been triaged must not be skipped on assignee.
+            if lane == "ready" and not _card_passed_triage(conn, task_id):
+                result.kind_gated.append((task_id, assignee, "untriaged"))
+                _send_untriaged_to_triage(conn, task_id, dry_run=dry_run)
+                return False
+            # dispatcher-fix-20261006: a triaged ready card must never be
+            # stranded by the title gate (that is what parked 9-13 cards in
+            # `ready` with 0 spawns on 5-6 Oct).
+            if lane == "ready" and _expected_assignee == "mk-minimax":
+                # Triage-kind title ("uzupełnij", "Cron:", "werdykt:", ...)
+                # on a card that ALREADY passed triage and was given to a GLM
+                # worker: triage is done, mk-minimax must not take ready work
+                # without fallback_from, so honour the triage verdict.
+                _expected_assignee = None
+            elif (lane == "ready" and assignee in _KIND_REROUTABLE
+                    and _expected_assignee in _KIND_REROUTABLE):
+                # Title belongs to the other GLM lane (Research -> mk-duzy,
+                # weryfikacja/szablon -> mk-szybki): re-route instead of
+                # stranding. Status stays ready, no claim, no model_override
+                # write; the next tick evaluates caps for the new assignee.
+                result.kind_rerouted.append((task_id, assignee, _expected_assignee))
+                _reroute_kind_mismatch(
+                    conn, task_id, assignee, _expected_assignee, _title_kind,
+                    dry_run=dry_run,
+                )
+                return False
+        if _expected_assignee is not None and not _kb._has_manual_override(conn, task_id):
+            # Counted so the health warning names the reason instead of
+            # reporting a bare zero spawn with a non-empty ready queue
+            # (#3ce0c112).
+            result.kind_gated.append((task_id, assignee, _expected_assignee))
+            _gate_key = (task_id, assignee, _expected_assignee)
+            if _gate_key not in _KIND_GATE_LOGGED:
+                _KIND_GATE_LOGGED.add(_gate_key)
+                # WARNING, not INFO: the gateway journal only carries WARNING+,
+                # so an INFO line here made a stranded card invisible.
+                _kb._log.warning(
+                    "kanban kind-gate task=%s kind=%s assignee=%s expected=%s",
+                    task_id, _title_kind, assignee, _expected_assignee,
+                )
+            return False
+    # Unclassified title (_expected_assignee is None): the gate has no opinion
+    # on ownership, so it must not let a card that never passed triage bypass
+    # triage. Untriaged work still goes back through triage (#3ce0c112).
+    if _expected_assignee is None and lane == "ready" \
+            and not _kb._has_manual_override(conn, task_id) \
+            and not _card_passed_triage(conn, task_id):
+        result.kind_gated.append((task_id, assignee, "unclassified_untriaged"))
+        _send_untriaged_to_triage(
+            conn, task_id, dry_run=dry_run,
+            reason="unclassified title, not yet triaged",
+        )
+        return False
+    # Type cap. Over-cap cards stay status ready (not blocked). Returning
+    # False makes the priority-ordered loop skip this card and keep going,
+    # so a later different type can still take a free global slot.
+    bucket = None
+    if type_running is not None:
+        try:
+            title = row["title"]
+        except (IndexError, KeyError):
+            got = conn.execute(
+                "SELECT title FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            title = got["title"] if got is not None else None
+        bucket = _title_type_bucket(title)
+        cap = _TYPE_CAPS.get(bucket) if bucket else None
+        if cap is not None and type_running.get(bucket, 0) >= cap:
+            result.type_capped.append((task_id, bucket))
+            return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2090,13 +2537,23 @@ def _dispatch_lane_task(
         # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+        if bucket:
+            type_running[bucket] = type_running.get(bucket, 0) + 1
+        if resolved_model and per_model_running is not None:
+            per_model_running[resolved_model] = per_model_running.get(resolved_model, 0) + 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    if lane == "review":
+        claimed = _kb.claim_review_task(conn, task_id, ttl_seconds=ttl_seconds)
+    elif lane == "triage":
+        claimed = _kb.claim_task(
+            conn, task_id, ttl_seconds=ttl_seconds, source_status="triage",
+        )
+    else:
+        claimed = _kb.claim_task(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
     try:
@@ -2232,12 +2689,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_full = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_full = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2269,7 +2728,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, model_override FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2281,6 +2740,9 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    type_running: Optional[dict[str, int]] = None,
+    per_model_caps: Optional[Mapping[str, int]] = None,
+    per_model_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
@@ -2302,6 +2764,20 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
+        if type_running is not None:
+            try:
+                title = row["title"]
+            except (IndexError, KeyError):
+                title = None
+            bucket = _title_type_bucket(title)
+            cap = _TYPE_CAPS.get(bucket) if bucket else None
+            if cap is not None and type_running.get(bucket, 0) >= cap:
+                continue
+        if per_model_caps is not None and per_model_running is not None:
+            model = _resolved_model_for_row(conn, row, assignee)
+            model_cap = per_model_caps.get(model) if model else None
+            if model_cap is not None and per_model_running.get(model, 0) >= model_cap:
+                continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
     return False
@@ -2350,9 +2826,17 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    from hermes_cli.kanban_triage_drain import drain_triage, sweep_blocked
+    sweep_blocked(conn)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
+    if may_spawn:
+        _release_triage_holds(conn)
+        _triage_budget = spawn_budget if spawn_budget is not None else 3
+        # Drain only parks human waits / archives do-not-resume. It must
+        # not keyword-promote, and leftover triage must not starve ready.
+        drain_triage(conn, _triage_budget)
     if not may_spawn:
         return result
 
@@ -2380,6 +2864,9 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    type_running = _count_running_type_buckets(conn)
+    per_model_caps = _per_model_caps()
+    per_model_running = _count_running_by_resolved_model(conn)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2388,15 +2875,42 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        type_running=type_running,
+        per_model_caps=per_model_caps, per_model_running=per_model_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        type_running=type_running,
+        per_model_caps=per_model_caps, per_model_running=per_model_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
+    for row in _lane_rows(conn, "triage"):
+        if ready_budget is not None and spawned >= ready_budget:
+            break
+        if (not dry_run) and row["assignee"] != "mk-minimax":
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET assignee = 'mk-minimax' "
+                    "WHERE id = ? AND status = 'triage'",
+                    (row["id"],),
+                )
+        if _dispatch_lane_task(conn, row, "mk-minimax", result, lane="triage", **lane_kwargs):
+            spawned += 1
+    # Orphan mk-minimax on todo (never enters ready lane): back to triage.
+    if not dry_run:
+        for _orph in conn.execute(
+            "SELECT id FROM tasks WHERE assignee = 'mk-minimax' "
+            "AND status = 'todo' AND claim_lock IS NULL"
+        ).fetchall():
+            if not _kb._has_fallback_from_marker(conn, _orph["id"]):
+                _send_untriaged_to_triage(
+                    conn, _orph["id"], dry_run=False,
+                    reason="mk-minimax outside triage without fallback_from",
+                )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break

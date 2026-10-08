@@ -608,12 +608,31 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
+    skip_triage = bool(getattr(args, "skip_triage", False))
     with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+        try:
+            ok = kb.reassign_task(
+                conn, args.task_id, profile,
+                reclaim_first=reclaim,
+                reason=getattr(args, "reason", None),
+                skip_triage=skip_triage,
+                by="cli",
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    extra = ""
+    if reclaim:
+        extra += " (claim reclaimed)"
+    if skip_triage:
+        extra += " (skip-triage → ready)"
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
-        f"Reassigned {args.task_id} to {profile or '(unassigned)'}" + (" (claim reclaimed)" if reclaim else ""),
+        f"Reassigned {args.task_id} to {profile or '(unassigned)'}" + extra,
     )
 
 

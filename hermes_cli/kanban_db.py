@@ -1196,8 +1196,8 @@ def create_task(
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
-    Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
-    forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    Status: ``triage`` with assignee ``mk-minimax``. ``initial_status="blocked"``
+    is the only other entry and parks the card for a human.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1216,6 +1216,11 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # Create never assigns a work profile. Triage (mk-minimax) reassigns
+    # to mk-duzy or mk-szybki. requested_assignee is audit only.
+    requested_assignee = assignee
+    if assignee != "mk-minimax":
+        assignee = "mk-minimax"
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1313,6 +1318,7 @@ def create_task(
                     "created",
                     {
                         "assignee": assignee,
+                        "requested_assignee": requested_assignee,
                         "status": task_status,
                         "parents": list(parents),
                         "creator_task_id": creator_task_id,
@@ -1475,6 +1481,38 @@ def list_tasks(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+
+_SKIP_TRIAGE_ASSIGNEES = frozenset({"mk-duzy", "mk-szybki"})
+_FALLBACK_FROM_ASSIGNEES = frozenset({"mk-duzy", "mk-szybki"})
+
+
+def _has_manual_override(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest ``reassigned`` event carries skip_triage/manual_override."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reassigned' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    payload = _json_dict(_row_get(row, "payload"))
+    return bool(payload.get("manual_override") or payload.get("skip_triage"))
+
+
+def _has_fallback_from_marker(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest ``fallback_from`` event came from mk-duzy/mk-szybki to mk-minimax."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'fallback_from' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    payload = _json_dict(_row_get(row, "payload"))
+    src = payload.get("from") or payload.get("from_assignee")
+    dst = payload.get("to") or payload.get("assignee") or "mk-minimax"
+    return src in _FALLBACK_FROM_ASSIGNEES and dst == "mk-minimax"
+
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -2195,32 +2233,58 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, source_status: str = "ready",
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``source_status -> running``.
 
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    Default (ready lane) is ``ready -> running``. ``triage -> running`` is
+    accepted only when the caller passes ``source_status="triage"`` and the
+    card is assigned to ``mk-minimax``. Any other source is refused with no
+    write. Does not set ``ready`` and does not change ``assignee``.
     """
+    if source_status not in ("ready", "triage"):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
+        if source_status == "triage":
+            # Only mk-minimax may take a triage card. No status or assignee write.
+            row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ? AND status = 'triage' "
+                "AND claim_lock IS NULL",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["assignee"] != "mk-minimax":
+                return None
+        else:
+            # Outside triage: mk-minimax claims ONLY with fallback_from marker
+            # (glm-flash 2x429 path that reassigned from mk-duzy/mk-szybki).
+            row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ? AND claim_lock IS NULL",
+                (task_id,),
+            ).fetchone()
+            if row is not None and row["assignee"] == "mk-minimax":
+                if not _has_fallback_from_marker(conn, task_id):
+                    return None
+            if not _parents_satisfied(conn, task_id):
+                # Single enforcement point: never ready -> running with an undone
+                # parent, whichever writer set 'ready'. Demote to 'todo';
+                # recompute_ready re-promotes when the parents finish.
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
+                )
+                _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+                return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
+            conn, task_id, statuses=(source_status,), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, source_status, lock, expires, now,
+            event_extra={"source_status": "triage"} if source_status == "triage" else None,
+        )
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2262,15 +2326,21 @@ def _retry_status_for_run(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None,
 ) -> str:
     """``review`` when the run's ``claimed`` event says ``source_status=review``,
-    else ``ready`` — one place, so crash/timeout/reclaim can't silently turn a
-    reviewer run into an implementation run."""
+    ``triage`` when it says ``triage``, else ``ready`` — one place, so
+    crash/timeout/reclaim can't silently turn a reviewer or triage run into
+    an implementation run (and cannot promote triage straight to ready)."""
     if run_id is None:
         run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return "ready"
     event = _latest_event(conn, task_id, "claimed", run_id)
     payload = _json_dict(_row_get(event, "payload"))
-    return "review" if payload.get("source_status") == "review" else "ready"
+    source = payload.get("source_status")
+    if source == "review":
+        return "review"
+    if source == "triage":
+        return "triage"
+    return "ready"
 
 
 # Run outcome -> lifecycle status a goal loop should report for a handed-off run.
@@ -2528,19 +2598,62 @@ def reclaim_task(
 
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
-    reason: Optional[str] = None,
+    reason: Optional[str] = None, skip_triage: bool = False, by: Optional[str] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    ``skip_triage`` (mk-duzy / mk-szybki only): land in ``ready`` for that
+    assignee, emit ``reassigned`` with ``manual_override`` / ``skip_triage``,
+    and after a reclaim force status ``ready`` (not triage). The dispatcher
+    must not rewrite such a card back to mk-minimax / triage.
+    """
+    profile = _canonical_assignee(profile)
+    if skip_triage:
+        if profile not in _SKIP_TRIAGE_ASSIGNEES:
+            raise ValueError(
+                "--skip-triage allows only mk-duzy or mk-szybki "
+                f"(got {profile!r})"
+            )
+        if reclaim_first:
+            reclaim_task(conn, task_id, reason=reason or "reassign --skip-triage")
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["claim_lock"] is not None and row["status"] == "running":
+                raise RuntimeError(
+                    f"cannot reassign {task_id}: currently running (claimed). "
+                    "Pass --reclaim with --skip-triage."
+                )
+            prev = row["assignee"]
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, status = 'ready', "
+                "consecutive_failures = 0, last_failure_error = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_started_at = NULL "
+                "WHERE id = ? AND status NOT IN ('archived', 'done')",
+                (profile, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(conn, task_id, "reassigned", {
+                "assignee": profile,
+                "from": prev,
+                "manual_override": True,
+                "skip_triage": True,
+                "by": (by or "cli"),
+                "reason": reason,
+            })
+        notify_task_updated(conn, task_id, ("assignee", "status"))
+        return True
     if reclaim_first:
-        # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
-    # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
     except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
-        # needs to decide whether to retry with reclaim.
         return False
 
 
@@ -3140,6 +3253,12 @@ def edit_task(
     return True
 
 
+_QUOTA_WALL_RE = re.compile(
+    r"\b(quota|rate[\s_\-]?limit|429)\b",
+    re.IGNORECASE,
+)
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
@@ -3157,9 +3276,61 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    Fence-triage special case: when the block reason is the Hermes delegate
+    fence (worker could not write its triage verdict), apply the verdict
+    (mk-duzy/mk-szybki → ready) instead of parking ``blocked``; if the
+    assignee is unclear, send the card back to triage.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if _reason_looks_like_triage_fence(reason):
+        target = _parse_triage_assignee_from_reason(reason)
+        if target in _TRIAGE_VERDICT_ASSIGNEES:
+            try:
+                if apply_triage_verdict(
+                    conn, task_id, target,
+                    author="block_task_fence_redirect",
+                    require_own_env=False,
+                    allow_blocked=True,
+                ):
+                    return True
+            except (ValueError, PermissionError, RuntimeError):
+                pass
+        # Unclear / failed verdict → triage, never blocked on this fence.
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] not in ("running", "ready", "blocked", "todo"):
+                return False
+            run_id = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()[0]
+            if row["status"] == "running" and run_id is not None:
+                _end_run(
+                    conn, task_id, outcome="retriaged",
+                    summary="fence block → triage (no clear verdict)",
+                    status="triage",
+                )
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'triage', assignee = 'mk-minimax', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_started_at = NULL, current_run_id = NULL, block_kind = NULL "
+                "WHERE id = ? AND status = ?",
+                (task_id, row["status"]),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(conn, task_id, "triaged", {
+                "reason": "fence block without clear triage verdict",
+                "assignee": "mk-minimax",
+                "block_reason": (reason or "")[:500],
+            })
+        notify_task_updated(conn, task_id, ("assignee", "status"))
+        return True
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3189,6 +3360,31 @@ def block_task(
             })
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        if reason and _QUOTA_WALL_RE.search(reason):
+            # Quota wall is rate_limited, never outcome=blocked.
+            qparams = (source_status, reason[:500], task_id)
+            qsql = (
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, last_failure_error = ? "
+                "WHERE id = ? AND status IN ('running', 'ready')"
+            )
+            if expected_run_id is not None:
+                qsql += " AND current_run_id = ?"
+                qparams = (*qparams, int(expected_run_id))
+            if conn.execute(qsql, qparams).rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id, outcome="rate_limited", status="rate_limited",
+                error=reason, summary=reason,
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="rate_limited", summary=reason, error=reason,
+                )
+            _append_event(conn, task_id, "rate_limited", {
+                "reason": reason, "source": "quota-wall",
+            }, run_id=run_id)
+            return True
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3211,6 +3407,7 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
+                       last_failure_error = NULL,
                        {set_sql}
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -3751,6 +3948,149 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+
+_TRIAGE_VERDICT_ASSIGNEES = frozenset({"mk-duzy", "mk-szybki"})
+_FENCE_REASON_MARKERS = (
+    "delegate_task child contexts cannot mutate",
+    "cannot mutate Kanban",
+    "twardy fence",
+    "Twardy fence",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "nie mogę zapisać assignee",
+    "nie moge zapisac assignee",
+    "brak narzędzia do zmiany assignee",
+    "brak narzedzia do zmiany assignee",
+    "Nadania assignee nie",
+    "nadania assignee nie",
+    "nie mam dozwolonej ścieżki do ustawienia assignee",
+    "CLI jest zfencowane",
+    "CLI Hermesa odmawia mutacji",
+)
+
+
+def _reason_looks_like_triage_fence(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+    low = reason.lower()
+    for marker in _FENCE_REASON_MARKERS:
+        if marker.lower() in low:
+            return True
+    return False
+
+
+def _parse_triage_assignee_from_reason(reason: Optional[str]) -> Optional[str]:
+    """Best-effort extract mk-duzy / mk-szybki from a triage/fence block reason."""
+    if not reason:
+        return None
+    # Prefer explicit assignee=/→ patterns over bare mentions.
+    patterns = [
+        r"assignee\s*=\s*(mk-duzy|mk-szybki)",
+        r"assignee\s*:\s*(mk-duzy|mk-szybki)",
+        r"→\s*(mk-duzy|mk-szybki)",
+        r"->\s*(mk-duzy|mk-szybki)",
+        r"karta\s*→\s*(mk-duzy|mk-szybki)",
+        r"reassign\s+\S+\s+(mk-duzy|mk-szybki)",
+        r"\b(mk-duzy|mk-szybki)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, reason, re.IGNORECASE)
+        if m:
+            return _canonical_assignee(m.group(1))
+    return None
+
+
+def _claimed_from_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the active/latest claim came from the triage lane."""
+    return _retry_status_for_run(conn, task_id) == "triage"
+
+
+def apply_triage_verdict(
+    conn: sqlite3.Connection, task_id: str, assignee: str, *,
+    author: Optional[str] = None, require_own_env: bool = True,
+    allow_blocked: bool = True,
+) -> bool:
+    """Triage worker writes its verdict on its OWN card: assignee mk-duzy|mk-szybki,
+    status ``ready``, event ``specified``.
+
+    Ownership: when ``require_own_env`` (default), ``HERMES_KANBAN_TASK`` must equal
+    ``task_id`` and the process must be the dispatcher-owned worker (not a
+    delegate_task child). Only those two assignees are accepted. Card must be
+    ``triage``, ``running`` claimed from triage, or (if ``allow_blocked``) ``blocked``
+    still assigned to mk-minimax.
+    """
+    import os
+    assignee = _canonical_assignee(assignee)
+    if assignee not in _TRIAGE_VERDICT_ASSIGNEES:
+        raise ValueError(
+            "triage verdict allows only mk-duzy or mk-szybki "
+            f"(got {assignee!r})"
+        )
+    if require_own_env:
+        env_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        if env_tid != task_id:
+            raise PermissionError(
+                "apply_triage_verdict: only the worker's own HERMES_KANBAN_TASK "
+                f"(env={env_tid!r}, asked={task_id!r})"
+            )
+        try:
+            from agent.delegation_context import is_dispatcher_owned_worker_context
+            if not is_dispatcher_owned_worker_context():
+                raise PermissionError(
+                    "apply_triage_verdict: refused in delegate_task / non-dispatcher context"
+                )
+        except ImportError:
+            pass
+
+    allowed_status = {"triage", "running"}
+    if allow_blocked:
+        allowed_status.add("blocked")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if (row["assignee"] or None) != "mk-minimax":
+            return False
+        status = row["status"]
+        if status not in allowed_status:
+            return False
+        if status == "running" and not _claimed_from_triage(conn, task_id):
+            return False
+
+        # End an in-flight run cleanly when leaving running/blocked-with-run.
+        run_id = row["current_run_id"]
+        if status == "running" and run_id is not None:
+            _end_run(
+                conn, task_id, outcome="handed_off",
+                summary=f"triage verdict → {assignee}",
+                status="ready",
+            )
+
+        cur = conn.execute(
+            "UPDATE tasks SET assignee = ?, status = 'ready', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL, current_run_id = NULL, "
+            "block_kind = NULL, consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = ?",
+            (assignee, task_id, status),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "specified", {
+            "changed_fields": ["assignee", "status"],
+            "assignee": assignee,
+            "status": "ready",
+            "from_status": status,
+            "author": author or "triage-verdict",
+            "reason": "triage verdict",
+        })
+    notify_task_updated(conn, task_id, ("assignee", "status"))
+    return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -3977,6 +4317,14 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if task.status == "triage":
+        lines.append(
+            "Triage only (mk-minimax). Do not do the work, do not send mail, "
+            "do not verify a draft. Set assignee to mk-duzy (pismo, rada, autor, research, Kanał B2C) "
+            "or mk-szybki (weryfikacja, szablony, cron-raporty, Mail todo, "
+            "unknown titles), then set status ready. Never leave the card on "
+            "mk-minimax, mk, or mk-rada. Verification never goes to MiniMax."
+        )
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
