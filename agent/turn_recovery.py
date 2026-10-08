@@ -10,6 +10,7 @@ mutate ``agent`` / ``messages`` / ``api_messages`` in place. Logger name stays
 from __future__ import annotations
 
 import logging
+import random
 import locale
 import math
 import re
@@ -1764,6 +1765,65 @@ def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context:
     return _genuine
 
 
+def _exact_model_slug(model: object) -> str:
+    """Vendor prefix stripped. glm-5.3-flash is not glm-5.3."""
+    name = str(model or "").strip()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name
+
+
+def _pin_kanban_assignee_minimax(task_id, from_model: str, to_model: str) -> None:
+    """Running card only. Assignee mk-minimax, no model_override, no status change."""
+    import os
+    import sqlite3
+    log = logging.getLogger("agent.conversation_loop")
+    tid = str(task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not tid:
+        log.info("glm-flash-429: brak task id, assignee nie zmieniony")
+        return
+    db = (os.environ.get("HERMES_KANBAN_DB") or "/home/hermes/.hermes/kanban.db").strip()
+    con = sqlite3.connect(db, timeout=5)
+    try:
+        row = con.execute("SELECT assignee, status FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            log.info("glm-flash-429: task %s brak wiersza", tid)
+            return
+        prev, status = row[0], row[1]
+        if status != "running":
+            log.info("glm-flash-429: task %s status %s, assignee zostawiam", tid, status)
+            return
+        con.execute(
+            "UPDATE tasks SET assignee=? WHERE id=? AND status='running'",
+            ("mk-minimax", tid),
+        )
+        # Marker exclusive to this glm-flash-429 fallback path (claim gate).
+        import json
+        import time as _time
+        con.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'fallback_from', ?, ?)",
+            (
+                tid,
+                json.dumps({
+                    "from": prev,
+                    "to": "mk-minimax",
+                    "reason": "glm-flash-429",
+                    "from_model": from_model,
+                    "to_model": to_model,
+                }, ensure_ascii=False),
+                int(_time.time()),
+            ),
+        )
+        con.commit()
+        log.info(
+            "glm-flash-429: task %s assignee %s -> mk-minimax model %s -> %s bez model_override",
+            tid, prev, from_model, to_model,
+        )
+    finally:
+        con.close()
+
+
 def route_classified_error(
     agent: Any, api_error: Exception, classified: Any, _retry: TurnRetryState, *, error_msg: str,
     error_context: Any, recovered_with_pool: bool, base_url: Any, model: Any,
@@ -1888,9 +1948,74 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+    # glm-5.3: 429 retries the same model. No MiniMax descent and no assignee change.
+    # glm-5.3-flash: one wait of 45–60s (random), one retry. A second 429 commits
+    # the card to MiniMax for the rest of this process and moves assignee to mk-minimax.
+    # The retry flag lives on the agent (TurnRetryState is rebuilt per API call).
+    _slug = _exact_model_slug(model if model else getattr(agent, "model", ""))
+    _zai_429 = (
+        is_rate_limited
+        and _wrapped_output_cap_budget is None
+        and not _is_zai_coding_overload
+        and not getattr(agent, "_fallback_activated", False)
+        and "z.ai" in str(base_url).lower()
+    )
+    if (
+        _zai_429
+        and _slug == "glm-5.3-flash"
+        and not getattr(agent, "_glm_flash_429_retried", False)
+        and not getattr(agent, "_mk_card_locked_minimax", False)
+    ):
+        _wait_s = random.uniform(45.0, 60.0)
+        agent._buffer_diagnostic_status(
+            f"GLM flash rate limited. Waiting {_wait_s:.1f}s, then one retry before MiniMax."
+        )
+        _wait_hit = interruptible_backoff_sleep(
+            agent, _wait_s, _retry,
+            messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count,
+            abort_message="Interrupt detected during GLM flash 429 wait, aborting.",
+            interrupt_text="Operation interrupted: waiting before one GLM flash retry after 429.",
+            activity_label="GLM flash 429 wait",
+        )
+        if _wait_hit is not None:
+            return _verdict("return", _wait_hit)
+        agent._glm_flash_429_retried = True
+        return _verdict("continue")
+    if _zai_429 and _slug == "glm-5.3-flash" and getattr(agent, "_glm_flash_429_retried", False):
+        agent._glm_flash_commit_minimax = True
+    if (
+        _zai_429
+        and _slug not in ("glm-5.3", "glm-5.3-flash")
+        and not getattr(agent, "_glm_429_deferred", False)
+    ):
+        agent._glm_429_deferred = True
+        agent._buffer_diagnostic_status(
+            "GLM rate limited. Waiting 45s, then one more try before fallback."
+        )
+        _wait_hit = interruptible_backoff_sleep(
+            agent, 45.0, _retry,
+            messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count,
+            abort_message="Interrupt detected during GLM 429 wait, aborting.",
+            interrupt_text="Operation interrupted: waiting 45s before retrying GLM after 429.",
+            activity_label="GLM 429 wait",
+        )
+        if _wait_hit is not None:
+            return _verdict("return", _wait_hit)
+        return _verdict("continue")
+
+    _suppress_glm53_fallback = (
+        _slug == "glm-5.3"
+        and is_rate_limited
+        and _wrapped_output_cap_budget is None
+    )
     _should_fallback = (
-        (is_rate_limited and _wrapped_output_cap_budget is None)
-        or (_is_transport_failure and retry_count >= 2)
+        not _suppress_glm53_fallback
+        and (
+            (is_rate_limited and _wrapped_output_cap_budget is None)
+            or (_is_transport_failure and retry_count >= 2)
+        )
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
@@ -1904,6 +2029,12 @@ def route_classified_error(
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+                if (
+                    getattr(agent, "_glm_flash_commit_minimax", False)
+                    and _exact_model_slug(getattr(agent, "model", "")) == "MiniMax-M3.1-Flash-Preview"
+                ):
+                    agent._mk_card_locked_minimax = True
+                    _pin_kanban_assignee_minimax(effective_task_id, _slug, agent.model)
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:

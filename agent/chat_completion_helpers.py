@@ -1972,6 +1972,38 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
+
+def _syn_chat_quota_blocks(fb_model: str) -> bool:
+    """Skip only syn:large:text while the synthetic-chat 24h block is on.
+
+    Every call re-reads fallback.log and the deadline file under mk-data/usage.
+    The count is not cached in this process. Synthetic search is not consulted.
+    Fail-open if the gate cannot be read. A turn already on syn is not aborted;
+    this runs only when a fresh fallback candidate is considered.
+    """
+    if (fb_model or "").strip() != "syn:large:text":
+        return False
+    mod = getattr(_syn_chat_quota_blocks, "_mod", None)
+    if mod is None:
+        try:
+            import importlib.util
+            path = "/home/hermes/mk-data/usage/syn_chat_gate.py"
+            spec = importlib.util.spec_from_file_location("mk_syn_chat_gate", path)
+            if spec is None or spec.loader is None:
+                return False
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc:
+            logger.warning("syn chat gate import failed (%s); not skipping syn", type(exc).__name__)
+            return False
+        _syn_chat_quota_blocks._mod = mod
+    try:
+        return bool(mod.blocks_syn_chat())
+    except Exception as exc:
+        logger.warning("syn chat gate read failed (%s); not skipping syn", type(exc).__name__)
+        return False
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1979,6 +2011,11 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    if _syn_chat_quota_blocks(fb_model):
+        logger.warning(
+            "Fallback skip: %s/%s synthetic chat is in a 24h block (daily cap); not selecting syn:large:text",
+            fb_provider, fb_model)
         return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
