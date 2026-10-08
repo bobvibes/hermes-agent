@@ -1425,6 +1425,9 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
 
 
 def restore_primary_runtime(agent) -> bool:
+    if getattr(agent, "_mk_card_locked_minimax", False):
+        return False
+    agent._glm_429_deferred = False
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
     if not agent._fallback_activated:

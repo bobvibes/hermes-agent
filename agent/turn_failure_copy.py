@@ -363,6 +363,14 @@ def site_copy(code: str, **fields: Any) -> str:
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
     limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401)."""
+    if reason in (FailoverReason.rate_limit.value, FailoverReason.upstream_rate_limit.value):
+        if reset_seconds is not None and reset_seconds >= 120:
+            minutes = max(2, int((reset_seconds + 59) // 60))
+            return (
+                f"Limit zapytań zjadł cały łańcuch, wracam na główny model za {minutes} min, "
+                "napisz wtedy jeszcze raz."
+            )
+        return "Limit zapytań zjadł cały łańcuch, za minutę wracam na główny model, napisz jeszcze raz."
     first_attempt = attempts == 1 and reason in _EXHAUSTED_FIRST_ATTEMPT_LEADS
     lead = (_EXHAUSTED_FIRST_ATTEMPT_LEADS if first_attempt else _EXHAUSTED_LEADS).get(
         reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)
