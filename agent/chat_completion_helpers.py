@@ -2115,7 +2115,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     _cur_model = str(getattr(agent, "model", "") or "").strip()
     if "/" in _cur_model:
         _cur_model = _cur_model.rsplit("/", 1)[-1]
-    if _cur_model == "glm-5.3" and reason is not None:
+    # mk 08.10 (decyzja Michała): reguła glm-5.3 działa tylko poza workerami kanbana (gateway, cron), jak dziś;
+    # worker kanbana (HERMES_KANBAN_TASK) zachowuje dzisiejszy fallback mk-duzy (glm-5.3) -> MiniMax po 429.
+    _mk_glm53_rule = not os.environ.get("HERMES_KANBAN_TASK")
+    if _mk_glm53_rule and _cur_model == "glm-5.3" and reason is not None:
         _rname = getattr(reason, "value", None) or str(reason)
         if _rname in ("rate_limit", "upstream_rate_limit") or "rate_limit" in _rname:
             logger.info("Fallback skip: glm-5.3 zostaje na glm-5.3 po 429")
@@ -2137,7 +2140,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         _cur = str(getattr(agent, "model", "") or "").strip()
         if "/" in _cur:
             _cur = _cur.rsplit("/", 1)[-1]
-        if _cur == "glm-5.3" and (fb_provider == "minimax" or fb_model.startswith("MiniMax")):
+        if _mk_glm53_rule and _cur == "glm-5.3" and (fb_provider == "minimax" or fb_model.startswith("MiniMax")):
             logger.info(
                 "Fallback skip: glm-5.3 nie schodzi na MiniMax (%s)", fb_model,
             )
