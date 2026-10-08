@@ -222,6 +222,32 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
 )
 
 
+KANBAN_TRIAGE_ASSIGN_SCHEMA = _schema(
+    "kanban_triage_assign",
+    (
+        "Triage ONLY (mk-minimax): write the triage verdict on THIS worker's own card. "
+        "Sets assignee to mk-duzy or mk-szybki and status to ready, then releases the "
+        "claim. Use after you have classified the card. Refused for any other assignee, "
+        "any other card, or when not running as the dispatcher-owned triage worker."
+    ),
+    {
+        "assignee": {
+            "type": "string",
+            "description": "Target work profile: mk-duzy or mk-szybki only.",
+        },
+        "task_id": {
+            "type": "string",
+            "description": "Optional; defaults to HERMES_KANBAN_TASK (must match own card).",
+        },
+        "reason": {
+            "type": "string",
+            "description": "Short classification note (audit only).",
+        },
+    },
+    required=["assignee"],
+)
+
+
 KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
     "kanban_request_review",
     (

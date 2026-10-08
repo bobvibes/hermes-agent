@@ -263,6 +263,8 @@ _SPECS = [
         _arg("profile", help="New profile name (or 'none' to unassign)"),
         _arg("--reclaim", action="store_true",
              help="Release any active claim before reassigning (required if task is running)"),
+        _arg("--skip-triage", action="store_true",
+             help="Land in ready for mk-duzy/mk-szybki; do not send back through triage"),
         _RECLAIM_REASON,
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
