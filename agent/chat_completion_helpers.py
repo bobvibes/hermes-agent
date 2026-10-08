@@ -2112,6 +2112,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    _cur_model = str(getattr(agent, "model", "") or "").strip()
+    if "/" in _cur_model:
+        _cur_model = _cur_model.rsplit("/", 1)[-1]
+    if _cur_model == "glm-5.3" and reason is not None:
+        _rname = getattr(reason, "value", None) or str(reason)
+        if _rname in ("rate_limit", "upstream_rate_limit") or "rate_limit" in _rname:
+            logger.info("Fallback skip: glm-5.3 zostaje na glm-5.3 po 429")
+            return False
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
@@ -2126,6 +2134,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        _cur = str(getattr(agent, "model", "") or "").strip()
+        if "/" in _cur:
+            _cur = _cur.rsplit("/", 1)[-1]
+        if _cur == "glm-5.3" and (fb_provider == "minimax" or fb_model.startswith("MiniMax")):
+            logger.info(
+                "Fallback skip: glm-5.3 nie schodzi na MiniMax (%s)", fb_model,
+            )
+            continue
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
