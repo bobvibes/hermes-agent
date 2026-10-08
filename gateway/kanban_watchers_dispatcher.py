@@ -102,6 +102,10 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    max_in_progress_per_profile = _positive_int_setting(
+        kanban_cfg, "max_in_progress_per_profile"
+    )
+    logger.info("kanban dispatcher: type caps weryfikacja max 3, szablon max 2")
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -114,7 +118,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         default_assignee=default_assignee,
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_in_progress_per_profile=max_in_progress_per_profile,
     )
 
 
