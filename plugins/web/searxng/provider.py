@@ -7,7 +7,7 @@ Env: ``SEARXNG_URL=http://localhost:8080``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from plugins.web._common import BaseWebSearchProvider, http_get_json, provider_env, search_fail, search_ok, setup_schema, titled_rows
 
@@ -22,21 +22,30 @@ class SearXNGWebSearchProvider(BaseWebSearchProvider):
     KEY_ENV = "SEARXNG_URL"
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
-        base_url = provider_env("SEARXNG_URL").rstrip("/")
-        if not base_url:
-            return search_fail("SEARXNG_URL is not set")
-        data, failure = http_get_json(
-            "SearXNG", f"{base_url}/search", params={"q": query, "format": "json", "pageno": 1},
-            headers={"Accept": "application/json"}, timeout=15, logger=logger, reach_target=f"SearXNG at {base_url}",
-        )
-        if failure is not None:
-            return failure
-        raw_results = data.get("results", [])
-        # SearXNG may return a score field; sort descending and cap to limit.
-        sorted_results = sorted(raw_results, key=lambda r: float(r.get("score", 0)), reverse=True)[:limit]
-        web_results = titled_rows(sorted_results, "content")
-        logger.info("SearXNG search '%s': %d results (from %d raw, limit %d)", query, len(web_results), len(raw_results), limit)
-        return search_ok(web_results)
+        """Backend name stays searxng. Search order is the keyless chain.
+
+        Synthetic until its hourly quota (250), then MiniMax (field q), then z.ai
+        until 80% of the MCP pool, then free Exa, Parallel, Keenable.
+        """
+        from plugins.web import keyless_mcp as km
+
+        chained = km._chain_search(query, limit)
+        if isinstance(chained, dict) and chained.get("success"):
+            return chained
+        errors = []
+        for vendor in ("exa", "parallel", "keenable"):
+            try:
+                out = km._KEYLESS_SEARCHERS[vendor](query, limit)
+            except Exception as exc:  # noqa: BLE001
+                errors.append("%s: %s" % (vendor, exc))
+                continue
+            if isinstance(out, dict) and out.get("success"):
+                out.setdefault("data", {})["served_by"] = vendor
+                return out
+            if isinstance(out, dict) and out.get("error"):
+                errors.append("%s: %s" % (vendor, out.get("error")))
+        detail = "; ".join(errors)[:300] if errors else "no member answered"
+        return search_fail("chain exhausted: " + detail)
 
     def get_setup_schema(self) -> dict[str, Any]:
         return setup_schema(
