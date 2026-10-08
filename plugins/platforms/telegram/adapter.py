@@ -4682,6 +4682,39 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         await query.answer(text=denial_text)
         return False
 
+
+    async def _handle_straznik_segment_callback(self, query, data: str, cb):
+        """ss:ok:segment:YYYYMMDD or ss:no:segment:YYYYMMDD. Firms from that message only."""
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        parts = data.split(":")
+        if len(parts) != 4 or parts[0] != "ss" or parts[1] not in ("ok", "no"):
+            await query.answer(text="Zły przycisk.")
+            return
+        action, segment, day = parts[1], parts[2], parts[3]
+        if (not segment or len(day) != 8 or not day.isdigit()
+                or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in segment)):
+            await query.answer(text="Zły przycisk.")
+            return
+        cmd = "akceptuj" if action == "ok" else "odrzuc"
+        await query.answer(text="Zapisuję." if cmd == "akceptuj" else "Zapisane.")
+        import subprocess
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["/usr/bin/python3",
+             "/home/hermes/.hermes/profiles/mk/scripts/straznik_segmentow.py",
+             cmd, segment, day],
+            capture_output=True, text=True, timeout=90)
+        tail = (proc.stdout or proc.stderr or "").strip().splitlines()
+        info = tail[-1][:300] if tail else "brak odpowiedzi skryptu"
+        if cmd == "akceptuj":
+            edit = "Akceptuję. Zapis tylko firm z tej wiadomości, potem jeden segment.\n" + info
+        else:
+            edit = "Odrzucam. Pub i kolejka nietknięte.\n" + info
+        if proc.returncode != 0:
+            edit = "Nie udało się.\n" + info
+        await self._edit_md_quiet(query, edit)
+
     async def _handle_callback_query(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
@@ -4701,6 +4734,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("ss:", self._handle_straznik_segment_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
