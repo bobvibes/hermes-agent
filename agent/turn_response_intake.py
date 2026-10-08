@@ -60,6 +60,11 @@ def _fire_post_api_request_hook(
     api_call_count: Any, api_duration: Any, api_start_time: Any, api_request_id: Any,
     effective_task_id: Any, turn_id: Any,
 ) -> None:
+    try:
+        from agent.request_usage_log import log_api_response
+        log_api_response(agent, response, task_id=effective_task_id, duration_s=api_duration)
+    except Exception:
+        pass
     from agent.conversation_loop import _moa_reference_metrics_for_hook
 
     try:

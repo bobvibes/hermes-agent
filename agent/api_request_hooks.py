@@ -167,6 +167,17 @@ class ApiRequestHooksMixin:
         max_retries: Optional[int] = None, retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        try:
+            from agent.request_usage_log import log_api_error
+            log_api_error(
+                task_id=task_id,
+                platform=getattr(self, "platform", None),
+                model=getattr(self, "model", None),
+                status_code=status_code,
+                duration_s=(time.time() - api_start_time) if api_start_time else None,
+            )
+        except Exception:
+            pass
         # Lazy module import (not from-import) so tests can replace lifecycle dispatch at this call site.
         with suppress(Exception):
             from hermes_cli import lifecycle as _lifecycle
