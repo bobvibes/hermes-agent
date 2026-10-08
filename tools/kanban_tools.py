@@ -24,7 +24,9 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_TRIAGE_ASSIGN_SCHEMA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 _RUN_LIFECYCLE_TOOLS = frozenset({
     "kanban_complete", "kanban_block", "kanban_schedule",
     "kanban_request_review", "kanban_request_changes",
+    "kanban_triage_assign",
 })
 
 class _Reject(Exception):
@@ -870,6 +873,42 @@ def _handle_schedule(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
 
 
+@_kanban_handler("kanban_triage_assign")
+def _handle_triage_assign(args: dict, **kw) -> str:
+    """Write triage verdict on the worker's own card → ready + mk-duzy|mk-szybki."""
+    tid = _worker_guard("kanban_triage_assign", args)
+    assignee = _require_text(args, "assignee", "assignee is required (mk-duzy or mk-szybki)")
+    note = _redact_opt(args.get("reason"))
+    with _board(args.get("board")) as (kb, conn):
+        try:
+            ok = kb.apply_triage_verdict(
+                conn, tid, assignee,
+                author="kanban_triage_assign",
+                require_own_env=True,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+        except PermissionError as exc:
+            return tool_error(str(exc))
+        if not ok:
+            return tool_error(
+                "kanban_triage_assign refused: card must be mk-minimax in "
+                "triage/running-from-triage (or blocked), and assignee mk-duzy|mk-szybki."
+            )
+        if note:
+            try:
+                kb.add_comment(conn, tid, "mk-minimax", f"Triage verdict: {assignee}. {note}")
+            except Exception:
+                pass
+        task = kb.get_task(conn, tid)
+        return json.dumps({
+            "ok": True,
+            "task_id": tid,
+            "assignee": task.assignee if task else assignee,
+            "status": task.status if task else "ready",
+        })
+
+
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
@@ -1298,6 +1337,7 @@ _TOOLS = (
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
+    ("kanban_triage_assign", KANBAN_TRIAGE_ASSIGN_SCHEMA, _handle_triage_assign, "🏷"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),

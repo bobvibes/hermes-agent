@@ -222,7 +222,11 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
-    if not task.assignee:
+    # Triage cards are pre-assigned to the triage profile (mk-minimax) at create
+    # time, so an empty-assignee check alone never fires and the LLM's routing
+    # choice is discarded — the card then runs on the triage profile itself.
+    # Overwrite when the current assignee is the triage profile.
+    if not task.assignee or task.assignee == "mk-minimax":
         assignee_val = _normalize_assignee_choice(
             parsed.get("assignee"), default_assignee=routing.default_assignee, valid_names=routing.valid_names,
         )

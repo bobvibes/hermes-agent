@@ -308,7 +308,20 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    # dispatcher-fix-20261006: a tick held back only by
+                    # configured capacity (per-model / per-profile / type cap,
+                    # max_in_progress) is a saturated dispatcher, not a stuck
+                    # one. getattr keeps this safe if kanban_db_dispatch lacks
+                    # the helper (patch applied out of order).
+                    _cap_only = getattr(_kbd, "capacity_only_hold", None)
+                    capacity_hold = bool(
+                        _cap_only and _cap_only(res for _slug, res in (results or []))
+                    )
+                    bad_ticks = (
+                        bad_ticks + 1
+                        if ready_pending and not any_spawned and not capacity_hold
+                        else 0
+                    )
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
