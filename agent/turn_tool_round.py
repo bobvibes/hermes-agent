@@ -10,6 +10,9 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
+import random
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
@@ -18,6 +21,37 @@ from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
 logger = logging.getLogger("agent.conversation_loop")
+
+def _kanban_card_turn(effective_task_id) -> bool:
+    """Kanban card only: HERMES_KANBAN_TASK or id t_ + 8 hex. Not Telegram."""
+    env_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if env_id:
+        return True
+    tid = str(effective_task_id or "").strip()
+    return (
+        len(tid) == 10
+        and tid.startswith("t_")
+        and all(c in "0123456789abcdef" for c in tid[2:])
+    )
+
+
+def _sleep_kanban_turn_jitter(effective_task_id) -> None:
+    """One sleep per tool-loop turn of this card, before the next API call.
+
+    random.uniform(3, 10) is per worker process, not a shared clock and not a
+    concurrency cap. Skipped unless this turn is a kanban card.
+    """
+    if not _kanban_card_turn(effective_task_id):
+        return
+    delay = random.uniform(3.0, 10.0)
+    logger.info(
+        "kanban turn jitter %.2fs before next API call task=%s",
+        delay,
+        (os.environ.get("HERMES_KANBAN_TASK") or str(effective_task_id or "")),
+    )
+    time.sleep(delay)
+
+
 
 # Post-response housekeeping tools: a round made only of these mutes tool progress.
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
@@ -82,6 +116,8 @@ def run_tool_round(
     if _tvv.action == "return":
         return _verdict("return", _tvv.result)
     if _tvv.action == "continue":
+        # One pause for this turn, not per tool call in the same response.
+        _sleep_kanban_turn_jitter(effective_task_id)
         return _verdict("continue")
 
     # Normalize only this unpersisted turn. Each local bridge entry must pass
@@ -227,6 +263,8 @@ def run_tool_round(
     # follow-up API call can exceed the gateway inactivity timeout (HERMES_AGENT_TIMEOUT, default 1800s) and
     # the gateway kills the session before the next activity touch fires (#69559, #69131).
     agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
+    # Between this model response (tools already ran) and the next API call.
+    _sleep_kanban_turn_jitter(effective_task_id)
     return _verdict("continue")
 
 

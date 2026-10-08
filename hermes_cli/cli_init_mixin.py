@@ -293,6 +293,9 @@ class CLIInitMixin:
                 pass
 
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        # Per-process pin: listed kanban cards measure syn with an empty fallback.
+        if os.environ.get("HERMES_SYN_NO_FALLBACK") == "1":
+            self._fallback_model = []
 
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""

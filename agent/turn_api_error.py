@@ -360,6 +360,15 @@ def settle_unrecovered_error(
         logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
                     agent.log_prefix, retry_count)
         retry_count = max_retries
+    # 429 on this exact request: a same-model call a few seconds later is an empty
+    # shot. Measured 2026-10-02 (kanban workers): a non-200 followed within 8s by the
+    # same model was another 429, never 200. Fallback to the other model already
+    # happened above when the chain still had a candidate. The kanban requeue
+    # cooldown spaces the next real attempt. Do not burn the remaining retry budget
+    # on the model that just refused. Z.AI coding-overload keeps its long backoff.
+    if is_rate_limited and not _is_zai_coding_overload and retry_count < max_retries:
+        retry_count = max_retries
+
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
         # transient transport errors (stale pool, TCP reset).

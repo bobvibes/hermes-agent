@@ -41,6 +41,8 @@ class CLIChatTurnMixin:
             from hermes_cli.config_effective import load_user_config_effective
             from hermes_cli.fallback_config import get_fallback_chain
             self._fallback_model = get_fallback_chain(load_user_config_effective(fail_closed=True))
+            if os.environ.get("HERMES_SYN_NO_FALLBACK") == "1":
+                self._fallback_model = []
         except Exception as e:
             logger.debug("fallback chain sync skipped (keeping current chain): %s", e)
             return

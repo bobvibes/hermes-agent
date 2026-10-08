@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import random
 import sys
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -22,6 +23,35 @@ from agent.turn_context_compaction import _reanchor
 from agent.turn_truncation import boosted_output_cap
 
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _maybe_restore_primary_midturn(agent: Any) -> None:
+    """Return to the primary model inside a long single-turn worker once its cooldown elapsed.
+
+    Kanban workers are one chat -q turn with many API iterations. restore_primary_runtime
+    otherwise runs only at the next user turn, so a rate-limit cooldown that already expired
+    never hands traffic back to the primary and the fallback stays sticky for the whole task.
+    An unelapsed cooldown is left alone. A fallback that never armed a cooldown still waits
+    for the next user turn, matching the existing turn-scoped path.
+    """
+    if getattr(agent, "_fallback_activated", False) is not True:
+        return
+    until = getattr(agent, "_rate_limited_until", 0) or 0
+    try:
+        until = float(until)
+    except (TypeError, ValueError):
+        return
+    if until <= 0 or until > time.monotonic():
+        return
+    logger.info(
+        "Primary cooldown elapsed mid-turn; restoring primary before the next API call"
+    )
+    try:
+        agent._restore_primary_runtime()
+    except Exception:
+        logger.warning("Mid-turn primary restore failed", exc_info=True)
+
+
 
 
 def _anchors_current_turn(messages: Any, idx: Any, user_message: Any) -> bool:
@@ -414,6 +444,7 @@ def begin_iteration(
         if not agent.quiet_mode:
             agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)", diagnostic=True)
         return _verdict("break")
+    _maybe_restore_primary_midturn(agent)
     return _verdict("fallthrough")
 
 
