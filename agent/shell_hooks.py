@@ -365,13 +365,89 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     return result
 
 
+
+def _is_fallback_log_hook(spec: "ShellHookSpec") -> bool:
+    """Root-owned log-fallback.sh is not writable. The same event is logged here."""
+    cmd = os.path.expanduser(spec.command or "").strip()
+    return spec.event == "post_api_request" and cmd.endswith("log-fallback.sh")
+
+
+def _plain_id(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _fallback_assignee(task_id: str) -> str:
+    """Assignee from kanban.db for this task, else HERMES_PROFILE. No body, no secrets."""
+    if task_id:
+        db = (os.environ.get("HERMES_KANBAN_DB") or "/home/hermes/.hermes/kanban.db").strip()
+        try:
+            import sqlite3
+            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "SELECT assignee FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+            finally:
+                con.close()
+            if row and row[0]:
+                return str(row[0]).strip()
+        except Exception:
+            pass
+    return (os.environ.get("HERMES_PROFILE") or "").strip()
+
+
+def _append_fallback_log(stdin_json: str) -> None:
+    """One fallback.log line: the shell hook fields plus task_id and assignee."""
+    try:
+        payload = json.loads(stdin_json) if stdin_json else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    extra = payload.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    response_model = _plain_id(extra.get("response_model")) or _plain_id(extra.get("model"))
+    request_model = _plain_id(extra.get("model"))
+    task_id = _plain_id(os.environ.get("HERMES_KANBAN_TASK")) or _plain_id(extra.get("task_id"))
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "profil": _plain_id(payload.get("profile")),
+        "task_id": task_id,
+        "assignee": _fallback_assignee(task_id),
+        "model_odpowiedzial": response_model,
+        "model_zadania": request_model,
+        "provider": _plain_id(extra.get("provider")),
+        "base_url": _plain_id(extra.get("base_url")),
+        "sesja": _plain_id(payload.get("session_id")),
+    }
+    log_path = Path.home() / "mk-data" / "usage" / "fallback.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
     def _callback(**kwargs: Any) -> Optional[dict[str, Any]]:
         if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
             return None
-        return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
+        payload = _serialize_payload(spec.event, kwargs)
+        if _is_fallback_log_hook(spec):
+            try:
+                _append_fallback_log(payload)
+                return _evaluate_result(spec, {
+                    "returncode": 0, "stdout": "", "stderr": "",
+                    "timed_out": False, "elapsed_seconds": 0.0, "error": None,
+                })
+            except Exception:
+                logger.warning("fallback.log enrich failed; root hook will write the line without task id")
+        return _evaluate_result(spec, _spawn(spec, payload))
 
     _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{spec.command}]"
     return _callback
